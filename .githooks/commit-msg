@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python scripts/governance.py commit "$1"
