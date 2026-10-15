@@ -64,16 +64,16 @@ SECRET_RULES = {
     "private-key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     "github-token": re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b"),
     "aws-access-key": re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-    "assigned-secret": re.compile(rb"(?im)(?:api[_-]?key|client[_-]?secret|password|access[_-]?token)\s*[=:]\s*[\"']?([A-Za-z0-9/+_=.-]{20,})"),
+    "assigned-secret": re.compile(rb"(?im)(?<![A-Za-z0-9_-])(?:api[_-]?key|client[_-]?secret|password|access[_-]?token)[\"']?\s*[=:]\s*[\"']?([A-Za-z0-9/+_=.-]{20,})"),
 }
 
 def content_rules(data):
     return [rule for rule, pattern in SECRET_RULES.items() if pattern.search(data)]
 
-def scan():
+def scan(revisions=()):
     errors = []
     versions = [("index", item) for item in git("ls-files", "-z").decode().split("\0") if item]
-    for commit in git("rev-list", "--all").decode().splitlines():
+    for commit in git("rev-list", "--all", *revisions).decode().splitlines():
         versions += [(commit, item) for item in git("ls-tree", "-r", "--name-only", "-z", commit).decode().split("\0") if item]
     seen = set()
     for revision, name in versions:
@@ -86,6 +86,37 @@ def scan():
             seen.add(key)
             errors += [f"secret/{rule}: {name} ({revision[:12]})" for rule in content_rules(data)]
     return sorted(set(errors))
+
+def pre_push_errors(updates):
+    """Validate Git's actual pushed refs, including non-current and detached heads."""
+    errors = []
+    commits = set()
+    for line in updates.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            errors.append("push: malformed ref update")
+            continue
+        local_ref, local_oid, remote_ref, remote_oid = fields
+        if not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) for oid in (local_oid, remote_oid)):
+            errors.append("push: malformed object identifier")
+            continue
+        if not remote_ref.startswith("refs/heads/"):
+            errors.append("push: only semantic branch destinations are allowed")
+        else:
+            errors += branch_errors(remote_ref.removeprefix("refs/heads/"))
+        if set(local_oid) == {"0"}:
+            errors.append("push: branch deletion requires a separate authorized maintenance operation")
+            continue
+        revision = local_oid if set(remote_oid) == {"0"} else f"{remote_oid}..{local_oid}"
+        try:
+            commits.update(git("rev-list", revision).decode().splitlines())
+        except subprocess.CalledProcessError:
+            errors.append("push: cannot inspect commit range; fetch the destination before retrying")
+    for sha in sorted(commits):
+        errors += [f"{sha[:12]}: {error}" for error in commit_errors(git("show", "-s", "--format=%B", sha).decode())]
+    errors += scan(tuple(sorted(commits)))
+    return errors
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -108,7 +139,7 @@ def main():
     elif args.command == "scan":
         errors = scan()
     elif args.command == "pre-push":
-        errors = branch_errors(git("branch", "--show-current").decode().strip()) + scan()
+        errors = pre_push_errors(sys.stdin.read())
     else:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
         pr = event["pull_request"]

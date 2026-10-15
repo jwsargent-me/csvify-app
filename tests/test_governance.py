@@ -72,5 +72,75 @@ class GovernanceTests(unittest.TestCase):
             self.assertTrue(any("secret/github-token" in x for x in errors))
             self.assertNotIn(secret.decode(), "\n".join(errors))
 
+    def test_quoted_secret_keys(self):
+        for key in ("api_key", "client_secret", "password", "access_token"):
+            for quote in ('"', "'"):
+                value = b"q" * 24
+                fixture = (quote + key + quote + ": " + quote).encode() + value + quote.encode()
+                self.assertIn("assigned-secret", g.content_rules(fixture), key)
+        for fixture in (b'{"api_key": "EXAMPLE"}', b'{"password": "<placeholder>"}',
+                        b'{"not_password": "' + b"q" * 24 + b'"}'):
+            self.assertEqual([], g.content_rules(fixture))
+
+    def test_push_destinations_and_deletions(self):
+        oid = "a" * 40
+        zero = "0" * 40
+        with patch.object(g, "scan", return_value=[]), patch.object(g, "git", return_value=b""):
+            self.assertEqual([], g.pre_push_errors(f"HEAD {oid} refs/heads/fix/local-parser {zero}"))
+            for destination in ("refs/heads/main", "refs/heads/develop", "refs/heads/codex/setup", "refs/tags/v1"):
+                self.assertTrue(g.pre_push_errors(f"HEAD {oid} {destination} {zero}"), destination)
+            # Mixed pushes must inspect every destination; the checked-out branch is irrelevant.
+            self.assertTrue(g.pre_push_errors(f"HEAD {oid} refs/heads/fix/local-parser {zero}\nHEAD {oid} refs/heads/main {zero}"))
+            for destination in ("refs/heads/main", "refs/heads/fix/local-parser"):
+                self.assertTrue(g.pre_push_errors(f"(delete) {zero} {destination} {oid}"))
+            self.assertTrue(g.pre_push_errors("malformed update"))
+
+    def test_push_checks_actual_range(self):
+        old, new = "a" * 40, "b" * 40
+        def fake_git(*args):
+            if args[0] == "rev-list":
+                self.assertEqual(("rev-list", f"{old}..{new}"), args)
+                return (new + "\n").encode()
+            return b"I've completed your request\n"
+        with patch.object(g, "git", side_effect=fake_git), patch.object(g, "scan", return_value=[]) as scan:
+            self.assertTrue(g.pre_push_errors(f"refs/heads/other {new} refs/heads/fix/local-parser {old}"))
+            scan.assert_called_once_with((new,))
+
+    def test_new_push_checks_full_ancestry(self):
+        new = "b" * 40
+        with patch.object(g, "git", return_value=b"") as git, patch.object(g, "scan", return_value=[]):
+            self.assertEqual([], g.pre_push_errors(f"HEAD {new} refs/heads/fix/local-parser {'0' * 40}"))
+            git.assert_called_once_with("rev-list", new)
+
+    def test_unknown_push_range_fails_closed(self):
+        with patch.object(g, "git", side_effect=subprocess.CalledProcessError(128, "git")), patch.object(g, "scan", return_value=[]):
+            errors = g.pre_push_errors(f"HEAD {'a' * 40} refs/heads/fix/local-parser {'b' * 40}")
+            self.assertTrue(any("cannot inspect commit range" in error for error in errors))
+
+    def test_push_scans_dangling_commit_and_json_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", folder, *args], stderr=subprocess.DEVNULL)
+            git("init", "-b", "chore/repository-governance")
+            git("config", "user.name", "Policy Test")
+            git("config", "user.email", "policy@example.invalid")
+            git("commit", "--allow-empty", "-m", "test: establish fixture baseline")
+            base = git("rev-parse", "HEAD").decode().strip()
+            git("checkout", "--detach")
+            secret = b"q" * 24
+            (root / "config.json").write_bytes(b'{"api_key": "' + secret + b'"}')
+            git("add", ".")
+            git("commit", "-m", "test: add synthetic JSON fixture")
+            git("rm", "config.json")
+            git("commit", "-m", "Done")
+            head = git("rev-parse", "HEAD").decode().strip()
+            git("checkout", "chore/repository-governance")
+            with patch.object(g, "ROOT", root):
+                errors = g.pre_push_errors(f"HEAD {head} refs/heads/fix/local-parser {base}")
+            self.assertTrue(any("commit:" in error for error in errors))
+            self.assertTrue(any("secret/assigned-secret" in error for error in errors))
+            self.assertNotIn(secret.decode(), "\n".join(errors))
+
 if __name__ == "__main__":
     unittest.main()
